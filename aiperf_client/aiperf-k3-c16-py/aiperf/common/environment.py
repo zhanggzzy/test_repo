@@ -1,0 +1,1497 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""
+Environment Configuration Module
+
+Provides a hierarchical, type-safe configuration system using Pydantic BaseSettings.
+All settings can be configured via environment variables with the AIPERF_ prefix.
+
+Structure:
+    Environment.ACCURACY.*       - Accuracy benchmark settings
+    Environment.API_SERVER.*     - API server settings
+    Environment.COMPRESSION.*    - Compression settings for streaming file transfers
+    Environment.DATASET.*        - Dataset management
+    Environment.DEV.*            - Development and debugging settings
+    Environment.GPU.*            - GPU telemetry collection
+    Environment.HTTP.*           - HTTP client socket and connection settings
+    Environment.LOGGING.*        - Logging configuration
+    Environment.METRICS.*        - Metrics collection and storage
+    Environment.MLFLOW.*         - MLflow export settings
+    Environment.OTEL.*           - OTel metrics streaming
+    Environment.RECORD.*         - Record processing
+    Environment.SEARCH_PLANNER.* - Adaptive-search planner tunables
+    Environment.SERVER_METRICS.* - Server metrics collection
+    Environment.SERVICE.*        - Service lifecycle and communication
+    Environment.TIMING.*         - Timing manager settings
+    Environment.TOKENIZER.*      - Tokenizer pre-warm and loading
+    Environment.UI.*             - User interface settings
+    Environment.WANDB.*          - Weights & Biases export settings
+    Environment.WORKER.*         - Worker management and scaling
+    Environment.ZMQ.*            - ZMQ communication settings
+
+Examples:
+    # Via environment variables:
+    AIPERF_HTTP_SO_RCVBUF=20971520
+    AIPERF_WORKER_CPU_UTILIZATION_FACTOR=0.8
+
+    # In code:
+    print(f"Buffer: {Environment.HTTP.SO_RCVBUF}")
+    print(f"Workers: {Environment.WORKER.CPU_UTILIZATION_FACTOR}")
+"""
+
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import BeforeValidator, Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from aiperf.common.aiperf_logger import AIPerfLogger
+from aiperf.common.constants import IS_WINDOWS
+from aiperf.config.loader.parsing import (
+    parse_service_types,
+    parse_str_or_csv_list,
+)
+from aiperf.plugin.enums import ServiceType
+
+_logger = AIPerfLogger(__name__)
+
+__all__ = ["Environment"]
+
+
+class _AccuracySettings(BaseSettings):
+    """Accuracy benchmark settings.
+
+    Tunables for the accuracy benchmark loaders. Currently only pins the
+    LiveCodeBench dataset release so accuracy numbers are reproducible
+    across runs without requiring source edits.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="AIPERF_ACCURACY_")
+
+    LCB_RELEASE_TAG: str = Field(
+        default="v4_v5",
+        description="LiveCodeBench dataset subset (HF config name) "
+        "passed as the positional ``name`` arg to "
+        '``load_dataset("livecodebench/code_generation_lite", name, split="test", trust_remote_code=True)``. '
+        "Pins which monthly snapshot LCB serves so accuracy numbers "
+        "are reproducible across runs and branches. Default "
+        "``v4_v5`` matches lighteval's base subset; bump (e.g. to "
+        "``v6``) when the team rebaselines against a newer snapshot. "
+        "The loader always passes ``trust_remote_code=True`` so LCB's "
+        "dataset-loading script can execute on ``datasets`` v4+ "
+        "(mirrors lighteval's reference opt-in). Consumed by "
+        "``aiperf.accuracy.benchmarks.lcb_codegeneration``.",
+    )
+
+
+class _APIServerSettings(BaseSettings):
+    """API server settings.
+
+    Controls the host and port of the API server.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="AIPERF_API_SERVER_")
+
+    HOST: str = Field(
+        default="127.0.0.1",
+        description="Host to bind the API server to",
+    )
+    PORT: int | None = Field(
+        ge=1,
+        le=65535,
+        default=None,
+        description="Port to bind the API server to",
+    )
+    CORS_ORIGINS: list[str] = Field(
+        default=[],
+        description="List of CORS origins to allow (empty = no CORS, ['*'] = all origins)",
+    )
+    SHUTDOWN_TIMEOUT: float = Field(
+        ge=1.0,
+        le=300.0,
+        default=5.0,
+        description="Timeout in seconds for graceful API server shutdown before force-cancelling",
+    )
+    POST_COMPLETE_GRACE: float = Field(
+        ge=0.0,
+        le=300.0,
+        default=5.0,
+        description="Seconds the API listener stays open after a benchmark terminates "
+        "so polling clients can observe the final status before the server shuts down. "
+        "Set to 0 to skip the grace window and shut down immediately.",
+    )
+
+
+class _CompressionSettings(BaseSettings):
+    """Compression settings for streaming file transfers.
+
+    Controls chunk size and compression levels for zstd and gzip encodings
+    used in dataset and results file transfers.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_COMPRESSION_",
+    )
+
+    CHUNK_SIZE: int = Field(
+        ge=1024,
+        le=1048576,
+        default=65536,
+        description="Chunk size in bytes for streaming compressed data (default: 64KB)",
+    )
+    ZSTD_LEVEL: int = Field(
+        ge=1,
+        le=22,
+        default=3,
+        description="Zstandard compression level (1=fastest, 22=best compression, default: 3)",
+    )
+    GZIP_LEVEL: int = Field(
+        ge=1,
+        le=9,
+        default=6,
+        description="Gzip compression level (1=fastest, 9=best compression, default: 6)",
+    )
+
+
+class _CLIRunnerSettings(BaseSettings):
+    """CLI runner post-run callback behavior.
+
+    Controls whether OnComplete callback exceptions abort the run after all
+    callbacks attempt or are isolated and logged. Default is isolated so that
+    a single misbehaving callback (e.g. auto-plot in strict mode, third-party
+    hook) cannot bypass the deliberate ``os._exit`` hang-protection that
+    guards against multiprocessing/ZMQ teardown hangs in the parent process.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_",
+    )
+
+    RAISE_ON_CALLBACK_ERROR: bool = Field(
+        default=False,
+        description="When true, re-raise the first OnComplete callback exception "
+        "after running all remaining callbacks but before os._exit. Provides a "
+        "strict-mode contract where a callback raise propagates out "
+        "of the runner. When false (default) the exception is logged with full "
+        "traceback, the exit code is forced non-zero, and the process still "
+        "terminates via os._exit so leftover ZMQ/multiprocessing state cannot "
+        "hang the interpreter.",
+    )
+
+
+class _DatasetSettings(BaseSettings):
+    """Dataset loading and configuration.
+
+    Controls timeouts and behavior for dataset loading operations,
+    as well as memory-mapped dataset storage settings.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_DATASET_",
+    )
+
+    CONFIGURATION_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=300.0,
+        description="Timeout in seconds for dataset configuration operations",
+    )
+    MMAP_BASE_PATH: Path | None = Field(
+        default=None,
+        description="Base path for memory-mapped dataset files. If None, uses system temp directory. "
+        "Set to a shared filesystem path for Kubernetes mounted volumes. "
+        "Example: AIPERF_DATASET_MMAP_BASE_PATH=/mnt/shared-pvc "
+        "creates files at /mnt/shared-pvc/aiperf_mmap_{benchmark_id}/",
+    )
+    PUBLIC_DATASET_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=300.0,
+        description="Timeout in seconds for public dataset loading operations",
+    )
+    MEDIA_DOWNLOAD_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=60.0,
+        description="Timeout in seconds per media URL download when inline encoding is required",
+    )
+    MEDIA_DOWNLOAD_MAX_CONCURRENCY: int = Field(
+        ge=1,
+        le=100,
+        default=10,
+        description="Maximum number of concurrent media URL downloads",
+    )
+    INLINE_RECORDS_WARN_THRESHOLD: int = Field(
+        ge=1,
+        default=500,
+        description="Soft warning threshold for the number of inline `records:` "
+        "entries on a `FileDataset`. When total inline records exceed this "
+        "value, the config loader logs a warning suggesting the user move the "
+        "dataset to a JSONL file. No hard cap.",
+    )
+
+
+class _DagSettings(BaseSettings):
+    """Settings for DAG benchmark mode (`dag_jsonl` input type)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_DAG_",
+    )
+
+    FAIL_FAST: bool = Field(
+        default=False,
+        description="When True, abort the whole run on the first DAG child "
+        "error (cancel pending siblings, raise to PhaseRunner, terminate "
+        "phase). Default False - the orchestrator counts the error in "
+        "BranchStats.children_errored, releases the join slot, drains pending "
+        "siblings, and continues the run. Set via "
+        "AIPERF_DAG_FAIL_FAST=1 for strict CI assertions.",
+    )
+
+
+class _DeveloperSettings(BaseSettings):
+    """Development and debugging configuration.
+
+    Controls developer-focused features like debug logging, profiling, and internal metrics.
+    These settings are typically disabled in production environments.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_DEV_",
+    )
+
+    DEBUG_SERVICES: Annotated[
+        set[ServiceType] | None,
+        BeforeValidator(parse_service_types),
+    ] = Field(
+        default=None,
+        description="List of services to enable DEBUG logging for (comma-separated or multiple flags)",
+    )
+    ENABLE_YAPPI: bool = Field(
+        default=False,
+        description="Enable yappi profiling (Yet Another Python Profiler) for performance analysis. "
+        "Requires 'pip install yappi snakeviz'",
+    )
+    MODE: bool = Field(
+        default=False,
+        description="Enable AIPerf Developer mode for internal metrics and debugging",
+    )
+    SHOW_EXPERIMENTAL_METRICS: bool = Field(
+        default=False,
+        description="[Developer use only] Show experimental metrics in output (requires DEV_MODE)",
+    )
+    SHOW_INTERNAL_METRICS: bool = Field(
+        default=False,
+        description="[Developer use only] Show internal and hidden metrics in output (requires DEV_MODE)",
+    )
+    TRACE_SERVICES: Annotated[
+        set[ServiceType] | None,
+        BeforeValidator(parse_service_types),
+    ] = Field(
+        default=None,
+        description="List of services to enable TRACE logging for (comma-separated or multiple flags)",
+    )
+
+
+class _GPUSettings(BaseSettings):
+    """GPU telemetry collection configuration.
+
+    Controls GPU metrics collection frequency, endpoint detection, and shutdown behavior.
+    Metrics are collected from DCGM endpoints at the specified interval.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_GPU_",
+        env_parse_enums=True,
+    )
+
+    COLLECTION_INTERVAL: float = Field(
+        ge=0.01,
+        le=300.0,
+        default=0.333,
+        description="GPU telemetry metrics collection interval in seconds (default: 333ms, ~3Hz)",
+    )
+    DEFAULT_DCGM_ENDPOINTS: Annotated[
+        str | list[str],
+        BeforeValidator(parse_str_or_csv_list),
+    ] = Field(
+        default=["http://localhost:9400/metrics", "http://localhost:9401/metrics"],
+        description="Default DCGM endpoint URLs to check for GPU telemetry (comma-separated string or JSON array)",
+    )
+    EXPORT_BATCH_SIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=100,
+        description="Batch size for telemetry record export results processor",
+    )
+    FINAL_SCRAPE_GRACE_NS: int = Field(
+        ge=0,
+        le=60_000_000_000,
+        default=666_000_000,
+        description=(
+            "Grace window in nanoseconds appended to phase end_ns when computing "
+            "the GPU energy-counter delta. Energy is scraped on a cadence "
+            "(see COLLECTION_INTERVAL), so the trailing scrape often lands after "
+            "the phase ends; this grace lets it be included while bounding the "
+            "window so cooldown/idle samples and subsequent-phase samples don't "
+            "leak into the delta. Default 666_000_000 ns ~= 2x the default "
+            "333 ms COLLECTION_INTERVAL; raise this if you also raise "
+            "COLLECTION_INTERVAL."
+        ),
+    )
+    REACHABILITY_TIMEOUT: int = Field(
+        ge=1,
+        le=300,
+        default=10,
+        description="Timeout in seconds for checking GPU telemetry endpoint reachability during init",
+    )
+    SHUTDOWN_DELAY: float = Field(
+        ge=1.0,
+        le=300.0,
+        default=5.0,
+        description="Delay in seconds before shutting down GPU telemetry service to allow command response transmission",
+    )
+    THREAD_JOIN_TIMEOUT: float = Field(
+        ge=1.0,
+        le=300.0,
+        default=5.0,
+        description="Timeout in seconds for joining GPU telemetry collection threads during shutdown",
+    )
+
+
+class _HTTPSettings(BaseSettings):
+    """HTTP client socket and connection configuration.
+
+    Controls low-level socket options, keepalive settings, DNS caching, and connection
+    pooling for HTTP clients. These settings optimize performance for high-throughput
+    streaming workloads.
+
+    Video Generation Polling:
+        For async video generation APIs that use job polling (e.g., SGLang /v1/videos),
+        the poll interval is controlled by AIPERF_HTTP_VIDEO_POLL_INTERVAL. The max poll time uses
+        the --request-timeout-seconds CLI argument.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_HTTP_",
+    )
+
+    CONNECTION_LIMIT: int = Field(
+        ge=1,
+        le=65000,
+        default=2500,
+        description="Maximum number of concurrent HTTP connections",
+    )
+    KEEPALIVE_TIMEOUT: int = Field(
+        ge=0,
+        le=10000,
+        default=300,
+        description="HTTP connection keepalive timeout in seconds for connection pooling",
+    )
+    SO_RCVBUF: int = Field(
+        ge=1024,
+        default=10485760,  # 10MB
+        description="Socket receive buffer size in bytes (default: 10MB for high-throughput streaming)",
+    )
+    SO_RCVTIMEO: int = Field(
+        ge=1,
+        le=100000,
+        default=30,
+        description="Socket receive timeout in seconds",
+    )
+    SO_SNDBUF: int = Field(
+        ge=1024,
+        default=10485760,  # 10MB
+        description="Socket send buffer size in bytes (default: 10MB for high-throughput streaming)",
+    )
+    SO_SNDTIMEO: int = Field(
+        ge=1,
+        le=100000,
+        default=30,
+        description="Socket send timeout in seconds",
+    )
+    TCP_KEEPCNT: int = Field(
+        ge=1,
+        le=100,
+        default=1,
+        description="Maximum number of keepalive probes to send before considering the connection dead",
+    )
+    TCP_KEEPIDLE: int = Field(
+        ge=1,
+        le=100000,
+        default=60,
+        description="Time in seconds before starting TCP keepalive probes on idle connections",
+    )
+    TCP_KEEPINTVL: int = Field(
+        ge=1,
+        le=100000,
+        default=30,
+        description="Interval in seconds between TCP keepalive probes",
+    )
+    TCP_USER_TIMEOUT: int = Field(
+        ge=1,
+        le=1000000,
+        default=30000,
+        description="TCP user timeout in milliseconds (Linux-specific, detects dead connections)",
+    )
+    TTL_DNS_CACHE: int = Field(
+        ge=0,
+        le=1000000,
+        default=300,
+        description="DNS cache TTL in seconds for aiohttp client sessions",
+    )
+    FORCE_CLOSE: bool = Field(
+        default=False,
+        description="Force close connections after each request",
+    )
+    ENABLE_CLEANUP_CLOSED: bool = Field(
+        default=False,
+        description="Enable cleanup of closed ssl connections",
+    )
+    USE_DNS_CACHE: bool = Field(
+        default=True,
+        description="Enable DNS cache",
+    )
+    SSL_VERIFY: bool = Field(
+        default=True,
+        description="Enable SSL certificate verification. Set to False to disable verification. "
+        "WARNING: Disabling this is insecure and should only be used for testing in a trusted environment.",
+    )
+    REQUEST_CANCELLATION_SEND_TIMEOUT: float = Field(
+        ge=10.0,
+        le=3600.0,
+        default=300.0,
+        description="Safety net timeout in seconds for waiting for HTTP request to be fully sent "
+        "when request cancellation is enabled. Used as fallback when no explicit timeout is configured "
+        "to prevent hanging indefinitely while waiting for the request to be written to the socket.",
+    )
+    IP_VERSION: Literal["4", "6", "auto"] = Field(
+        default="4",
+        description="IP version for HTTP socket connections. "
+        "Options: '4' (AF_INET, default), '6' (AF_INET6), or 'auto' (AF_UNSPEC, system chooses).",
+    )
+    TRUST_ENV: bool = Field(
+        default=False,
+        description="Trust environment variables for HTTP client configuration. "
+        "When enabled, aiohttp will read proxy settings from HTTP_PROXY, HTTPS_PROXY, "
+        "and NO_PROXY environment variables.",
+    )
+    VIDEO_POLL_INTERVAL: float = Field(
+        ge=0.001,
+        le=10.0,
+        default=0.1,
+        description="Interval in seconds between status polls for async video generation jobs. "
+        "Lower values provide faster completion detection but increase server load. "
+        "Applies to the aiohttp transport.",
+    )
+
+
+class _LoggingSettings(BaseSettings):
+    """Logging system configuration.
+
+    Controls multiprocessing log queue size and other logging behavior.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_LOGGING_",
+    )
+
+    QUEUE_MAXSIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=1000,
+        description="Maximum size of the multiprocessing logging queue",
+    )
+
+
+class _MetricsSettings(BaseSettings):
+    """Metrics collection and storage configuration.
+
+    Controls metrics storage allocation and collection behavior.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_METRICS_",
+    )
+
+    ARRAY_INITIAL_CAPACITY: int = Field(
+        ge=100,
+        le=1000000,
+        default=10000,
+        description="Initial array capacity for metric storage dictionaries to minimize reallocation",
+    )
+    USAGE_PCT_DIFF_THRESHOLD: float = Field(
+        ge=0.0,
+        le=100.0,
+        default=10.0,
+        description="Percentage difference threshold for flagging discrepancies between API usage and client token counts (default: 10%)",
+    )
+    OSL_MISMATCH_PCT_THRESHOLD: float = Field(
+        ge=0.0,
+        le=100.0,
+        default=5.0,
+        description="Percentage difference threshold for flagging discrepancies between requested and actual output sequence length (default: 5%)",
+    )
+    OSL_MISMATCH_MAX_TOKEN_THRESHOLD: int = Field(
+        ge=1,
+        default=50,
+        description="Maximum absolute token threshold for OSL mismatch. The effective threshold is min(requested_osl * pct_threshold, this value). Makes threshold tighter for large OSL values (default: 50 tokens)",
+    )
+    TDIGEST_COMPRESSION: int = Field(
+        ge=20,
+        le=10000,
+        default=500,
+        description="t-digest sketch compression for list-valued record metric aggregation. Higher = more centroids, tighter percentile accuracy, larger sketch. Default 500 measured to keep worst-case relative percentile error under 0.05% on 50M-sample workloads (40x under the 0.5% claimed accuracy band) at ~4 KB sketch size.",
+    )
+
+
+class _OTelSettings(BaseSettings):
+    """OpenTelemetry metrics streaming configuration.
+
+    Controls buffering and flush behavior for OTLP metric streaming.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_OTEL_",
+    )
+
+    FLUSH_INTERVAL_SECONDS: float = Field(
+        ge=0.1,
+        le=60.0,
+        default=2.0,
+        description="Interval in seconds between periodic OTel metrics flushes",
+    )
+    MAX_BATCH_RECORDS: int = Field(
+        ge=1,
+        le=1000000,
+        default=500,
+        description="Maximum number of metric records to include in a single OTel flush",
+    )
+    MAX_BUFFERED_RECORDS: int = Field(
+        ge=1,
+        le=10000000,
+        default=10000,
+        description="Maximum number of buffered metric records before oldest records are dropped",
+    )
+    REQUEST_TIMEOUT_SECONDS: float = Field(
+        ge=0.1,
+        le=300.0,
+        default=10.0,
+        description="Timeout in seconds for OTel collector HTTP requests",
+    )
+
+
+class _MLflowSettings(BaseSettings):
+    """MLflow export configuration.
+
+    Controls timeout behavior for post-run MLflow artifact uploads.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_MLFLOW_",
+    )
+
+    EXPORT_TIMEOUT_SECONDS: float = Field(
+        ge=1.0,
+        le=600.0,
+        default=30.0,
+        description="Timeout in seconds for the post-run MLflow export operation. "
+        "If the MLflow tracking server is unreachable, the export will be abandoned "
+        "after this duration rather than blocking indefinitely.",
+    )
+
+
+class _RecordSettings(BaseSettings):
+    """Record processing and export configuration.
+
+    Controls batch sizes, processor scaling, and progress reporting for record processing.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_RECORD_",
+    )
+
+    EXPORT_BATCH_SIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=100,
+        description="Batch size for record export results processor",
+    )
+    RAW_EXPORT_BATCH_SIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=10,
+        description="Batch size for raw record writer processor",
+    )
+    PROCESSOR_SCALE_FACTOR: int = Field(
+        ge=1,
+        le=100,
+        default=4,
+        description="Scale factor for number of record processors to spawn based on worker count. "
+        "Formula: 1 record processor for every X workers",
+    )
+    PROGRESS_REPORT_INTERVAL: float = Field(
+        ge=0.1,
+        le=600.0,
+        default=2.0,
+        description="Interval in seconds between records progress report messages",
+    )
+    PROCESS_RECORDS_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=300.0,
+        description="Timeout in seconds for processing record results",
+    )
+
+
+class _SearchPlannerSettings(BaseSettings):
+    """Adaptive-search planner tunables.
+
+    Controls precision targets, warmup-phase injection, and request-count
+    presets for the smooth-isotonic and monotonic SLA-saturation search
+    planners. All values are read at planner-construction or
+    iteration-mutate time, so changes take effect on the next search run.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_SEARCH_PLANNER_",
+    )
+
+    SLA_PRECISION_DEFAULT: float = Field(
+        gt=0.0,
+        lt=1.0,
+        default=0.05,
+        description="Default SLA boundary search precision target. "
+        "The bisection / smooth-isotonic bracket halts when "
+        "(infeasible_min - feasible_max) / infeasible_min < this value, "
+        "and the cliff detector requires bracket_gap > this * x_hi to "
+        "report a cliff. 5% mirrors perf_analyzer's --binary-search default.",
+    )
+    DEFAULT_WARMUP_SECONDS: float = Field(
+        gt=0.0,
+        le=100000.0,
+        default=30.0,
+        description="Smooth-isotonic SLA planner: default warmup phase duration "
+        "in seconds injected into each iteration's cfg when "
+        "``cfg.sla_warmup_seconds`` is unset. Spec calls for "
+        "max(30s, 3*inter-batch-time) but inter-batch-time is unknown at "
+        "planner-time, so 30s is the safe floor. Must be strictly positive: "
+        "zero defeats the cold-KV-cache rationale that motivates the floor.",
+    )
+    FIRST_PROBE_WARMUP_FLOOR: float = Field(
+        gt=0.0,
+        le=100000.0,
+        default=60.0,
+        description="Smooth-isotonic SLA planner: minimum warmup duration in "
+        "seconds for the first probe at each swept-dim value. Cold KV-cache "
+        "and CUDA-graph compilation cost is largest the first time we hit a "
+        "given concurrency, so floor that probe at 60s. Must be strictly "
+        "positive: zero defeats the cold-KV-cache rationale.",
+    )
+    REPLICATE_WARMUP_FLOOR: float = Field(
+        gt=0.0,
+        le=100000.0,
+        default=15.0,
+        description="Smooth-isotonic SLA planner: minimum warmup duration in "
+        "seconds for replicate probes at an already-probed swept-dim value. "
+        "Replicates reuse the warm KV-cache / CUDA-graph state, so a shorter "
+        "warmup suffices. Must be strictly positive: zero defeats the floor.",
+    )
+    SLA_PRECISION_REQUESTS: dict[str, Annotated[int, Field(gt=0)]] = Field(
+        default={
+            "tight": 10000,
+            "normal": 1000,
+            "coarse": 300,
+        },
+        description="Mapping from ``cfg.sla_precision`` preset name to the "
+        "``phases.profiling.requests`` value injected when the user did not "
+        "set ``requests`` explicitly on the profiling phase. Drives p99 CI "
+        "width. Each value must be strictly positive — zero/negative request "
+        "counts surface as iteration-time failures otherwise. Override via "
+        "JSON, e.g. "
+        "``AIPERF_SEARCH_PLANNER_SLA_PRECISION_REQUESTS='{\"tight\": 20000}'``.",
+    )
+
+
+class _ServerMetricsSettings(BaseSettings):
+    """Server metrics collection configuration.
+
+    Controls server metrics collection frequency, endpoint detection, and shutdown behavior.
+    Metrics are collected from Prometheus-compatible endpoints at the specified interval.
+    Use `--no-server-metrics` CLI flag to disable collection.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_SERVER_METRICS_",
+        env_parse_enums=True,
+    )
+
+    COLLECTION_FLUSH_PERIOD: float = Field(
+        ge=0.0,
+        le=30.0,
+        default=2.0,
+        description="Time in seconds to continue collecting metrics after profiling completes, "
+        "allowing server-side metrics to flush/finalize before shutting down (default: 2.0s)",
+    )
+    COLLECTION_INTERVAL: float = Field(
+        ge=0.001,
+        le=300.0,
+        default=0.333,
+        description="Server metrics collection interval in seconds (default: 333ms, ~3Hz)",
+    )
+    EXPORT_BATCH_SIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=100,
+        description="Batch size for server metrics jsonl writer export results processor",
+    )
+    REACHABILITY_TIMEOUT: int = Field(
+        ge=1,
+        le=300,
+        default=10,
+        description="Timeout in seconds for checking server metrics endpoint reachability during init",
+    )
+    SHUTDOWN_DELAY: float = Field(
+        ge=1.0,
+        le=300.0,
+        default=5.0,
+        description="Delay in seconds before shutting down server metrics service to allow command response transmission",
+    )
+
+
+class _NetworkLatencySettings(BaseSettings):
+    """Network latency calibration configuration.
+
+    Controls the TCP-handshake RTT probes used to estimate the client-to-endpoint
+    network round-trip time so it can be subtracted from latency metrics. Probes run
+    throughout the profiling phase. Enable with `--network-latency-automatic`.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_NETWORK_LATENCY_",
+        env_parse_enums=True,
+    )
+
+    DEFAULT_PROBE_INTERVAL: float = Field(
+        ge=0.001,
+        le=300.0,
+        default=1.0,
+        description="Default seconds between RTT probes when --network-latency-ping-interval is unset (default: 1.0s, ~1Hz)",
+    )
+    MIN_SAMPLES: int = Field(
+        ge=1,
+        le=100000,
+        default=5,
+        description="Minimum number of successful RTT samples to collect; extra probes are issued at "
+        "profile completion if a short run did not reach this floor",
+    )
+    CONNECT_TIMEOUT: float = Field(
+        ge=0.001,
+        le=300.0,
+        default=5.0,
+        description="Timeout in seconds for a single TCP-handshake RTT probe",
+    )
+    COMPLETE_TOPUP_TIMEOUT: float = Field(
+        ge=0.0,
+        le=30.0,
+        default=3.0,
+        description="Wall-clock budget in seconds for the final MIN_SAMPLES top-up probes "
+        "at PROFILE_COMPLETE, kept well under the command-response budget so a slow "
+        "endpoint cannot stall completion",
+    )
+    EXPORT_BATCH_SIZE: int = Field(
+        ge=1,
+        le=1000000,
+        default=100,
+        description="Batch size for the network latency jsonl writer export results processor",
+    )
+
+
+class _TimingSettings(BaseSettings):
+    """Timing manager configuration.
+
+    Controls timing-related settings for credit phase execution and scheduling.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_TIMING_",
+    )
+
+    CANCEL_DRAIN_TIMEOUT: float = Field(
+        ge=1.0,
+        le=300.0,
+        default=10.0,
+        description="Timeout in seconds for waiting for cancelled credits to drain after phase timeout",
+    )
+    RATE_RAMP_UPDATE_INTERVAL: float = Field(
+        ge=0.01,
+        le=10.0,
+        default=0.1,
+        description="Update interval in seconds for continuous rate ramping (default 0.1s = 100ms)",
+    )
+
+
+class _ServiceSettings(BaseSettings):
+    """Service lifecycle and inter-service communication configuration.
+
+    Controls timeouts for service registration, startup, shutdown, command handling,
+    connection probing, heartbeats, and profile operations.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_SERVICE_",
+    )
+
+    COMMAND_RESPONSE_TIMEOUT: float = Field(
+        ge=1.0,
+        le=1000.0,
+        default=30.0,
+        description="Timeout in seconds for command responses",
+    )
+    COMMS_REQUEST_TIMEOUT: float = Field(
+        ge=1.0,
+        le=1000.0,
+        default=90.0,
+        description="Timeout in seconds for requests from req_clients to rep_clients",
+    )
+    CONNECTION_PROBE_INTERVAL: float = Field(
+        ge=0.1,
+        le=600.0,
+        default=0.1,
+        description="Interval in seconds for connection probes while waiting for initial connection to the zmq message bus",
+    )
+    CONNECTION_PROBE_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=90.0,
+        description="Maximum time in seconds to wait for connection probe response while waiting for initial connection to the zmq message bus",
+    )
+    CREDIT_PROGRESS_REPORT_INTERVAL: float = Field(
+        ge=1,
+        le=100000.0,
+        default=2.0,
+        description="Interval in seconds between credit progress report messages",
+    )
+    DISABLE_UVLOOP: bool = Field(
+        default=False,
+        description="Disable uvloop and use default asyncio event loop instead",
+    )
+    HEARTBEAT_INTERVAL: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=5.0,
+        description="Interval in seconds between heartbeat messages for component services",
+    )
+    PROFILE_CONFIGURE_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=600.0,
+        description="Timeout in seconds for profile configure command",
+    )
+    PROFILE_START_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=60.0,
+        description="Timeout in seconds for profile start command",
+    )
+    PROFILE_CANCEL_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=10.0,
+        description="Timeout in seconds for profile cancel command",
+    )
+    REGISTRATION_INTERVAL: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=1.0,
+        description="Interval in seconds between registration attempts for component services",
+    )
+    REGISTRATION_MAX_ATTEMPTS: int = Field(
+        ge=1,
+        le=100000,
+        default=10,
+        description="Maximum number of registration attempts before giving up",
+    )
+    REGISTRATION_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=30.0,
+        description="Timeout in seconds for service registration",
+    )
+    START_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=30.0,
+        description="Timeout in seconds for service start operations. Also bounds the per-phase wait for the first worker to register with the credit router before credit issuance begins; exceeding it fails the phase.",
+    )
+    TASK_CANCEL_TIMEOUT_SHORT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=2.0,
+        description="Maximum time in seconds to wait for simple tasks to complete when cancelling",
+    )
+    # Event loop health monitoring settings
+    EVENT_LOOP_HEALTH_ENABLED: bool = Field(
+        default=True,
+        description="Enable event loop health monitoring to detect blocked event loops. "
+        "When enabled, TimingManager and Worker services periodically check if the event loop is responsive "
+        "and log warnings when latency exceeds the threshold.",
+    )
+    EVENT_LOOP_HEALTH_INTERVAL: float = Field(
+        ge=0.05,
+        le=10.0,
+        default=0.25,
+        description="Interval in seconds between event loop health checks (default: 250ms). "
+        "The monitor sleeps for this duration and measures actual elapsed time to detect blocking.",
+    )
+    EVENT_LOOP_HEALTH_WARN_THRESHOLD_MS: float = Field(
+        gt=1.0,
+        le=10000.0,
+        default=25.0,
+        description="Warning threshold in milliseconds for event loop latency (default: 25ms). "
+        "If the actual sleep duration exceeds the expected duration by this amount, a warning is logged.",
+    )
+    # Health server settings for Kubernetes probes
+    HEALTH_ENABLED: bool = Field(
+        default=False,
+        description="Enable the lightweight health server for Kubernetes liveness/readiness probes. "
+        "When enabled, non-API services will start an HTTP server serving /healthz and /readyz endpoints.",
+    )
+    HEALTH_HOST: str = Field(
+        default="127.0.0.1",
+        description="Host to bind the health server to. Use '0.0.0.0' for Kubernetes deployments.",
+    )
+    HEALTH_PORT: int = Field(
+        ge=1,
+        le=65535,
+        default=8080,
+        description="Port for the health server HTTP endpoints (/healthz, /readyz).",
+    )
+    HEALTH_REQUEST_TIMEOUT: float = Field(
+        ge=0.1,
+        le=60.0,
+        default=5.0,
+        description="Timeout in seconds for reading health check HTTP requests.",
+    )
+    # Windows-only: TCP-loopback fallback for ZMQ IPC sockets (pyzmq on
+    # Windows does not support ipc://). Per-endpoint ports are derived
+    # deterministically from the IPC path; these settings move or resize
+    # the port window if the default conflicts with another service or
+    # if a collision fires (see `_validate_no_port_collisions`).
+    WINDOWS_TCP_BASE_PORT: int = Field(
+        ge=1024,
+        le=65535,
+        default=28000,
+        description="Windows-only: starting port for the ZMQ IPC TCP-loopback "
+        "fallback range. Per-endpoint ports are derived as "
+        "``base + (sha256_hash mod range)``. No-op on POSIX where ipc:// "
+        "is used directly.",
+    )
+    WINDOWS_TCP_PORT_RANGE: int = Field(
+        ge=64,
+        le=60000,
+        default=20000,
+        description="Windows-only: size of the TCP-loopback port window for "
+        "the ZMQ IPC fallback. Birthday-paradox collision probability for "
+        "n sockets is ``1 - exp(-n*n/(2*range))``. Widen if AIPerf grows "
+        "to many more sockets per run, or relocate via "
+        "``AIPERF_SERVICE_WINDOWS_TCP_BASE_PORT`` if 28000-48000 conflicts.",
+    )
+
+    @model_validator(mode="after")
+    def auto_disable_uvloop_on_windows(self) -> Self:
+        """Automatically disable uvloop on Windows as it's not supported.
+
+        Validator fires on every ``_ServiceSettings()`` construction, which
+        runs once in the main process AND once per spawned child service.
+        Gate the log line to the main process so the user sees it once, not
+        ~9 times per aiperf run on Windows.
+        """
+        if IS_WINDOWS and not self.DISABLE_UVLOOP:
+            import multiprocessing
+
+            if multiprocessing.parent_process() is None:
+                _logger.info(
+                    "Windows detected: automatically disabling uvloop (not supported on Windows)"
+                )
+            self.DISABLE_UVLOOP = True
+        return self
+
+    @model_validator(mode="after")
+    def validate_windows_port_window_fits_in_tcp_range(self) -> Self:
+        """Fail fast if the configured Windows TCP-fallback port window would
+        emit invalid ports above the TCP max (65535).
+
+        ``build_socket_address`` derives an endpoint port as
+        ``WINDOWS_TCP_BASE_PORT + (sha256_hash mod WINDOWS_TCP_PORT_RANGE)``.
+        With the two fields bounded independently, a config like base 65000
+        + range 20000 would silently produce ``tcp://127.0.0.1:84999`` —
+        invalid, and only blowing up later at ZMQ bind/connect time with a
+        misleading error. Validate the sum at config time so misconfigured
+        envs fail with a clear, actionable message.
+
+        No-op on POSIX where ipc:// is used and these fields are dead. The
+        check fires anyway because ``_ServiceSettings`` validation runs on
+        every platform — but the only cost is the addition, which is cheap.
+        """
+        max_port = self.WINDOWS_TCP_BASE_PORT + self.WINDOWS_TCP_PORT_RANGE - 1
+        if max_port > 65535:
+            raise ValueError(
+                f"AIPERF_SERVICE_WINDOWS_TCP_BASE_PORT "
+                f"({self.WINDOWS_TCP_BASE_PORT}) + "
+                f"AIPERF_SERVICE_WINDOWS_TCP_PORT_RANGE "
+                f"({self.WINDOWS_TCP_PORT_RANGE}) - 1 = {max_port} exceeds "
+                f"the max TCP port (65535). Lower either value so the "
+                f"window stays within 1024-65535."
+            )
+        return self
+
+
+class _TokenizerSettings(BaseSettings):
+    """Tokenizer pre-warm and loading configuration.
+
+    Controls how the CLI parent pre-warms tokenizer caches before
+    spawning AIPerf services. Pre-warming runs in subprocesses so the
+    parent never imports the heavy native libraries (``transformers``,
+    Rust-backed ``tokenizers``, ``tiktoken``).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_TOKENIZER_",
+    )
+
+    PRELOAD_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=120.0,
+        description=(
+            "Timeout in seconds for the parent's tokenizer pre-warm phase. "
+            "Bounds the total wall-clock time for all parallel subprocess "
+            "pre-warms. On timeout, subprocesses are killed and AIPerf "
+            "continues; child services may then download tokenizers "
+            "themselves on first use."
+        ),
+    )
+    SKIP_PRELOAD: bool = Field(
+        default=False,
+        description=(
+            "Skip parent-process tokenizer cache pre-warming. Intended for "
+            "test harnesses that replace tokenizer loading and must avoid "
+            "forked prefetch subprocesses. Production defaults to preloading."
+        ),
+    )
+
+
+class _WandbSettings(BaseSettings):
+    """Weights & Biases export configuration.
+
+    Controls timeout behavior for the post-run W&B upload.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_WANDB_",
+    )
+
+    EXPORT_TIMEOUT_SECONDS: float = Field(
+        ge=1.0,
+        le=600.0,
+        default=30.0,
+        description="Timeout in seconds for the post-run Weights & Biases export operation. "
+        "If the W&B backend is unreachable, the export will be abandoned "
+        "after this duration rather than blocking indefinitely.",
+    )
+
+
+class _UISettings(BaseSettings):
+    """User interface and dashboard configuration.
+
+    Controls refresh rates, update thresholds, and notification behavior for the
+    various UI modes (dashboard, tqdm, etc.).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_UI_",
+    )
+
+    LOG_REFRESH_INTERVAL: float = Field(
+        ge=0.01,
+        le=100000.0,
+        default=0.1,
+        description="Log viewer refresh interval in seconds (default: 10 FPS)",
+    )
+    MIN_UPDATE_PERCENT: float = Field(
+        ge=0.01,
+        le=100.0,
+        default=1.0,
+        description="Minimum percentage difference from last update to trigger a UI update (for non-dashboard UIs)",
+    )
+    NOTIFICATION_TIMEOUT: int = Field(
+        ge=1,
+        le=100000,
+        default=3,
+        description="Duration in seconds to display UI notifications before auto-dismissing",
+    )
+    REALTIME_METRICS_INTERVAL: float = Field(
+        ge=1.0,
+        le=1000.0,
+        default=5.0,
+        description="Interval in seconds between real-time metrics messages",
+    )
+    REALTIME_METRICS_ENABLED: bool = Field(
+        default=False,
+        description="Enable real-time metrics collection and reporting despite UI type",
+    )
+    SPINNER_REFRESH_RATE: float = Field(
+        ge=0.1,
+        le=100.0,
+        default=0.1,
+        description="Progress spinner refresh rate in seconds (default: 10 FPS)",
+    )
+
+
+class _WorkerSettings(BaseSettings):
+    """Worker management and auto-scaling configuration.
+
+    Controls worker pool sizing, health monitoring, load detection, and recovery behavior.
+    The CPU_UTILIZATION_FACTOR is used in the auto-scaling formula:
+    max_workers = max(1, min(int(cpu_count * factor) - 1, MAX_WORKERS_CAP))
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_WORKER_",
+    )
+
+    CHECK_INTERVAL: float = Field(
+        ge=0.1,
+        le=100000.0,
+        default=1.0,
+        description="Interval in seconds between worker status checks by WorkerManager",
+    )
+    CPU_UTILIZATION_FACTOR: float = Field(
+        ge=0.1,
+        le=1.0,
+        default=0.75,
+        description="Factor multiplied by CPU count to determine default max workers (0.0-1.0). "
+        "Formula: max(1, min(int(cpu_count * factor) - 1, MAX_WORKERS_CAP))",
+    )
+    ERROR_RECOVERY_TIME: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=3.0,
+        description="Time in seconds from last error before worker is considered healthy again",
+    )
+    HEALTH_CHECK_INTERVAL: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=2.0,
+        description="Interval in seconds between worker health check messages",
+    )
+    HIGH_LOAD_CPU_USAGE: float = Field(
+        ge=50.0,
+        le=100.0,
+        default=85.0,
+        description="CPU usage percentage threshold for considering a worker under high load",
+    )
+    HIGH_LOAD_RECOVERY_TIME: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=5.0,
+        description="Time in seconds from last high load before worker is considered recovered",
+    )
+    MAX_WORKERS_CAP: int = Field(
+        ge=1,
+        le=10000,
+        default=32,
+        description="Absolute maximum number of workers to spawn, regardless of CPU count",
+    )
+    STALE_TIME: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=10.0,
+        description="Time in seconds from last status report before worker is considered stale",
+    )
+    STATUS_SUMMARY_INTERVAL: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=0.5,
+        description="Interval in seconds between worker status summary messages",
+    )
+
+
+class _ZMQSettings(BaseSettings):
+    """ZMQ socket and communication configuration.
+
+    Controls ZMQ socket timeouts, keepalive settings, retry behavior, and concurrency limits.
+    These settings affect reliability and performance of the internal message bus.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_ZMQ_",
+    )
+
+    CONTEXT_TERM_TIMEOUT: float = Field(
+        ge=1.0,
+        le=100000.0,
+        default=10.0,
+        description="Timeout in seconds for terminating the ZMQ context during shutdown",
+    )
+    PULL_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received messages from ZMQ PULL clients. "
+        "Prevents event loop starvation during message bursts. "
+        "0 disables yielding, 1 yields after every message, 10 yields every 10 messages, etc.",
+    )
+    REPLY_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received requests from ZMQ ROUTER reply clients. "
+        "Prevents event loop starvation during request bursts. "
+        "0 disables yielding, 1 yields after every request, 10 yields every 10 requests, etc.",
+    )
+    REQUEST_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received responses from ZMQ DEALER request clients. "
+        "Prevents event loop starvation during response bursts. "
+        "0 disables yielding, 1 yields after every response, 10 yields every 10 responses, etc.",
+    )
+    STREAMING_DEALER_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received messages from ZMQ streaming DEALER clients. "
+        "Prevents event loop starvation during message bursts. "
+        "0 disables yielding, 1 yields after every message, 10 yields every 10 messages, etc.",
+    )
+    STREAMING_ROUTER_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received messages from ZMQ streaming ROUTER clients. "
+        "Prevents event loop starvation during message bursts. "
+        "0 disables yielding, 1 yields after every message, 10 yields every 10 messages, etc.",
+    )
+    SUB_YIELD_INTERVAL: int = Field(
+        ge=0,
+        le=1_000_000,
+        default=10,
+        description="Yield to the event loop after every N received messages from ZMQ SUB clients. "
+        "Prevents event loop starvation during message bursts. "
+        "0 disables yielding, 1 yields after every message, 10 yields every 10 messages, etc.",
+    )
+    PULL_MAX_CONCURRENCY: int = Field(
+        ge=1,
+        le=10000000,
+        default=100_000,
+        description="Maximum concurrency for ZMQ PULL clients",
+    )
+    PUSH_MAX_RETRIES: int = Field(
+        ge=1,
+        le=100,
+        default=2,
+        description="Maximum number of retry attempts when pushing messages to ZMQ PUSH socket",
+    )
+    PUSH_RETRY_DELAY: float = Field(
+        ge=0.1,
+        le=1000.0,
+        default=0.1,
+        description="Delay in seconds between retry attempts for ZMQ PUSH operations",
+    )
+    RCVTIMEO: int = Field(
+        ge=1,
+        le=10000000,
+        default=300000,  # 5 minutes
+        description="Socket receive timeout in milliseconds (default: 5 minutes)",
+    )
+    SNDTIMEO: int = Field(
+        ge=1,
+        le=10000000,
+        default=300000,  # 5 minutes
+        description="Socket send timeout in milliseconds (default: 5 minutes)",
+    )
+    TCP_KEEPALIVE_IDLE: int = Field(
+        ge=1,
+        le=100000,
+        default=60,
+        description="Time in seconds before starting TCP keepalive probes on idle ZMQ connections",
+    )
+    TCP_KEEPALIVE_INTVL: int = Field(
+        ge=1,
+        le=100000,
+        default=10,
+        description="Interval in seconds between TCP keepalive probes for ZMQ connections",
+    )
+    EVENT_BUS_PROXY_FRONTEND_PORT: int = Field(
+        ge=1,
+        le=65535,
+        default=5663,
+        description="Default TCP port for the event-bus XPUB/XSUB proxy frontend "
+        "(producers connect here). Single source of truth for the non-k8s comm "
+        "configs (TCP, dual-bind); k8s pod manifests pull the same value via "
+        "``K8sEnvironment.PORTS.EVENT_BUS_PROXY_PUB_FRONTEND`` (defaults match).",
+    )
+    EVENT_BUS_PROXY_BACKEND_PORT: int = Field(
+        ge=1,
+        le=65535,
+        default=5664,
+        description="Default TCP port for the event-bus XPUB/XSUB proxy backend "
+        "(subscribers connect here). See ``EVENT_BUS_PROXY_FRONTEND_PORT``.",
+    )
+
+
+class _Environment(BaseSettings):
+    """
+    Root environment configuration with nested subsystem settings.
+
+    This is a singleton instance that loads configuration from environment variables
+    with the AIPERF_ prefix. Settings are organized into logical subsystems for
+    better discoverability and maintainability.
+
+    All nested settings can be configured via environment variables using the pattern:
+    AIPERF_{SUBSYSTEM}_{SETTING_NAME}
+
+    Example:
+        AIPERF_HTTP_CONNECTION_LIMIT=5000
+        AIPERF_WORKER_CPU_UTILIZATION_FACTOR=0.8
+        AIPERF_ZMQ_RCVTIMEO=600000
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="allow",
+    )
+
+    # Nested subsystem settings (alphabetically ordered)
+    ACCURACY: _AccuracySettings = Field(
+        default_factory=_AccuracySettings,
+        description="Accuracy benchmark settings (dataset version pins, etc.)",
+    )
+    API_SERVER: _APIServerSettings = Field(
+        default_factory=_APIServerSettings,
+        description="API server settings",
+    )
+    COMPRESSION: _CompressionSettings = Field(
+        default_factory=_CompressionSettings,
+        description="Compression settings for streaming file transfers",
+    )
+    CLI_RUNNER: _CLIRunnerSettings = Field(
+        default_factory=_CLIRunnerSettings,
+        description="CLI runner post-run callback isolation settings",
+    )
+    DATASET: _DatasetSettings = Field(
+        default_factory=_DatasetSettings,
+        description="Dataset loading and configuration settings",
+    )
+    DAG: _DagSettings = Field(
+        default_factory=_DagSettings,
+        description="DAG benchmark mode settings (dag_jsonl input type)",
+    )
+    DEV: _DeveloperSettings = Field(
+        default_factory=_DeveloperSettings,
+        description="Development and debugging settings",
+    )
+    GPU: _GPUSettings = Field(
+        default_factory=_GPUSettings,
+        description="GPU telemetry collection settings",
+    )
+    HTTP: _HTTPSettings = Field(
+        default_factory=_HTTPSettings,
+        description="HTTP client socket and connection settings",
+    )
+    LOGGING: _LoggingSettings = Field(
+        default_factory=_LoggingSettings,
+        description="Logging system settings",
+    )
+    METRICS: _MetricsSettings = Field(
+        default_factory=_MetricsSettings,
+        description="Metrics collection and storage settings",
+    )
+    MLFLOW: _MLflowSettings = Field(
+        default_factory=_MLflowSettings,
+        description="MLflow export settings",
+    )
+    OTEL: _OTelSettings = Field(
+        default_factory=_OTelSettings,
+        description="OpenTelemetry metrics streaming settings",
+    )
+    RECORD: _RecordSettings = Field(
+        default_factory=_RecordSettings,
+        description="Record processing and export settings",
+    )
+    SEARCH_PLANNER: _SearchPlannerSettings = Field(
+        default_factory=_SearchPlannerSettings,
+        description="Adaptive-search planner tunables",
+    )
+    NETWORK_LATENCY: _NetworkLatencySettings = Field(
+        default_factory=_NetworkLatencySettings,
+        description="Network latency calibration settings",
+    )
+    SERVER_METRICS: _ServerMetricsSettings = Field(
+        default_factory=_ServerMetricsSettings,
+        description="Server metrics collection settings",
+    )
+    SERVICE: _ServiceSettings = Field(
+        default_factory=_ServiceSettings,
+        description="Service lifecycle and communication settings",
+    )
+    TIMING: _TimingSettings = Field(
+        default_factory=_TimingSettings,
+        description="Timing manager settings",
+    )
+    TOKENIZER: _TokenizerSettings = Field(
+        default_factory=_TokenizerSettings,
+        description="Tokenizer pre-warm and loading settings",
+    )
+    UI: _UISettings = Field(
+        default_factory=_UISettings,
+        description="User interface and dashboard settings",
+    )
+    WANDB: _WandbSettings = Field(
+        default_factory=_WandbSettings,
+        description="Weights & Biases export settings",
+    )
+    WORKER: _WorkerSettings = Field(
+        default_factory=_WorkerSettings,
+        description="Worker management and scaling settings",
+    )
+    ZMQ: _ZMQSettings = Field(
+        default_factory=_ZMQSettings,
+        description="ZMQ communication settings",
+    )
+
+    @model_validator(mode="after")
+    def validate_dev_mode(self) -> Self:
+        """Validate that developer mode is enabled for features that require it."""
+        if self.DEV.SHOW_INTERNAL_METRICS and not self.DEV.MODE:
+            _logger.warning(
+                "Developer mode is not enabled, disabling AIPERF_DEV_SHOW_INTERNAL_METRICS"
+            )
+            self.DEV.SHOW_INTERNAL_METRICS = False
+
+        if self.DEV.SHOW_EXPERIMENTAL_METRICS and not self.DEV.MODE:
+            _logger.warning(
+                "Developer mode is not enabled, disabling AIPERF_DEV_SHOW_EXPERIMENTAL_METRICS"
+            )
+            self.DEV.SHOW_EXPERIMENTAL_METRICS = False
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_profile_configure_timeout(self) -> Self:
+        """Validate that the profile configure timeout is at least as long as the dataset configuration timeout."""
+        if self.SERVICE.PROFILE_CONFIGURE_TIMEOUT < self.DATASET.CONFIGURATION_TIMEOUT:
+            raise ValueError(
+                f"AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT: {self.SERVICE.PROFILE_CONFIGURE_TIMEOUT} must be greater than or equal to AIPERF_DATASET_CONFIGURATION_TIMEOUT: {self.DATASET.CONFIGURATION_TIMEOUT}"
+            )
+        return self
+
+
+# Global singleton instance
+Environment = _Environment()
